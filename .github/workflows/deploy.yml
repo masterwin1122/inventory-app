@@ -30,6 +30,12 @@ jobs:
           role-to-assume: arn:aws:iam::767044641724:role/gha-inventory-role
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Ensure jq is available
+        run: |
+          if ! command -v jq >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
       - name: Login to ECR
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -49,15 +55,31 @@ jobs:
 
       - name: Register task def & deploy
         run: |
-          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition > td.json
-          jq '.containerDefinitions[0].image = env.ECR_URI + ":" + env.IMAGE_TAG |
-              del(.revision,.status,.taskDefinitionArn,.requiresAttributes,.compatibilities)' td.json > td-new.json
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query 'taskDefinition' > td.json
+
+          # Update the image for the correct container, then keep ONLY fields register-task-definition accepts
+          jq --arg NAME "$CONTAINER_NAME" --arg IMAGE "$ECR_URI:$IMAGE_TAG" '
+            .containerDefinitions = (.containerDefinitions
+              | map(if .name == $NAME then .image = $IMAGE else . end)) |
+            {
+              family, taskRoleArn, executionRoleArn, networkMode,
+              containerDefinitions, volumes, placementConstraints,
+              requiresCompatibilities, cpu, memory, tags,
+              pidMode, ipcMode, proxyConfiguration, inferenceAccelerators,
+              runtimePlatform, ephemeralStorage
+            } | del(..|nulls)
+          ' td.json > td-new.json
+
           NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://td-new.json \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
+                         --query 'taskDefinition.taskDefinitionArn' --output text)
+
           aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_TD_ARN"
           aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
 
       - name: Health check
+        if: ${{ always() }}
+        continue-on-error: true
         run: |
-          ALB=$(aws elbv2 describe-load-balancers --names ultimate-cicd-dev-alb --query 'LoadBalancers[0].DNSName' --output text)
-          curl -s "http://$ALB/healthz" || true
+          ALB=$(aws elbv2 describe-load-balancers --names ultimate-cicd-dev-alb --query 'LoadBalancers[0].DNSName' --output text || true)
+          if [ -n "$ALB" ]; then curl -si "http://$ALB/healthz" || true; fi
