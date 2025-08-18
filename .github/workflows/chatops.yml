@@ -1,0 +1,238 @@
+name: ChatOps
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  id-token: write          # OIDC to AWS
+  contents: read
+  issues: write            # to comment back on issues/PRs
+  pull-requests: write
+
+concurrency:
+  group: chatops
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPO: inventory-api
+  ECS_CLUSTER: ultimate-dev-cluster
+  ECS_SERVICE: ultimate-cicd-dev-svc
+  ECS_TASK_FAMILY: ultimate-cicd-dev-task
+  CONTAINER_NAME: inventory-api
+
+jobs:
+  chatops:
+    if: contains(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Authorize only repo owner (security guardrail)
+        id: auth
+        run: |
+          if [ "${{ github.actor }}" != "masterwin1122" ]; then
+            echo "unauthorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "unauthorized=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop if unauthorized (but acknowledge)
+        if: steps.auth.outputs.unauthorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue || context.payload.pull_request;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `:no_entry: Sorry @${context.actor}, ChatOps is limited to the repo owner.`
+            });
+
+      - uses: actions/checkout@v4
+        if: steps.auth.outputs.unauthorized != 'true'
+
+      - name: Configure AWS (OIDC)
+        if: steps.auth.outputs.unauthorized != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::767044641724:role/gha-inventory-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure jq present
+        if: steps.auth.outputs.unauthorized != 'true'
+        run: |
+          if ! command -v jq >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      - name: Parse command
+        id: parse
+        if: steps.auth.outputs.unauthorized != 'true'
+        run: |
+          BODY="${{ github.event.comment.body }}"
+          CMD=$(echo "$BODY" | awk '{print tolower($1)}')
+          ARG=$(echo "$BODY" | awk 'NR==1{print $2}')
+          echo "cmd=$CMD" >> $GITHUB_OUTPUT
+          echo "arg=$ARG" >> $GITHUB_OUTPUT
+
+      # ===== /status =====
+      - name: Collect status
+        id: status
+        if: steps.parse.outputs.cmd == '/status'
+        run: |
+          set -euo pipefail
+          STATUS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].{desired:desiredCount,running:runningCount,status:status}' --output json)
+
+          EVENTS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].events[:5].[createdAt,message]' --output table || true)
+
+          TG_ARN=$(aws elbv2 describe-target-groups --names ultimate-cicd-dev-tg \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+          HEALTH=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+              --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)
+
+          ALB=$(aws elbv2 describe-load-balancers --names ultimate-cicd-dev-alb \
+              --query 'LoadBalancers[0].DNSName' --output text || true)
+
+          {
+            echo "**Status:** \`$STATUS\`"
+            echo "**Target health:** \`$HEALTH\`"
+            echo "**ALB:** http://$ALB/healthz"
+            echo
+            echo "**Recent events:**"
+            echo '```'
+            echo "$EVENTS"
+            echo '```'
+          } > comment.txt
+
+          COMMENT=$(cat comment.txt | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+          echo "body=$COMMENT" >> $GITHUB_OUTPUT
+
+      - name: Reply with status
+        if: steps.parse.outputs.cmd == '/status'
+        uses: actions/github-script@v7
+        env:
+          BODY: ${{ steps.status.outputs.body }}
+        with:
+          script: |
+            const issue = context.payload.issue || context.payload.pull_request;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number, body: process.env.BODY
+            });
+
+      # ===== /redeploy =====
+      - name: Force new deployment
+        if: steps.parse.outputs.cmd == '/redeploy'
+        run: |
+          set -euo pipefail
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --force-new-deployment
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Reply redeploy ok
+        if: steps.parse.outputs.cmd == '/redeploy'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue || context.payload.pull_request;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number,
+              body: ":arrows_counterclockwise: Redeploy triggered and reached steady state."
+            });
+
+      # ===== /rollback =====
+      - name: Roll back to previous task def
+        id: rb
+        if: steps.parse.outputs.cmd == '/rollback'
+        run: |
+          set -euo pipefail
+          PREV=$(aws ecs list-task-definitions --family-prefix "$ECS_TASK_FAMILY" --sort DESC \
+                  --max-items 2 --query 'taskDefinitionArns[1]' --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$PREV"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "prev=$PREV" >> $GITHUB_OUTPUT
+
+      - name: Reply rollback ok
+        if: steps.parse.outputs.cmd == '/rollback'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue || context.payload.pull_request;
+            const prev = process.env.PREV;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `:rewind: Rolled back to \`${prev}\`.`
+            });
+        env:
+          PREV: ${{ steps.rb.outputs.prev }}
+
+      # ===== /deploy [ref] =====
+      - name: Deploy a ref (build → push → register TD → update service)
+        id: dep
+        if: steps.parse.outputs.cmd == '/deploy'
+        run: |
+          set -euo pipefail
+          REF="${{ steps.parse.outputs.arg || 'main' }}"
+          echo "Deploying ref: $REF"
+
+          TMP=$(mktemp -d)
+          git clone --depth=1 --branch "$REF" "https://github.com/${{ github.repository }}.git" "$TMP"
+          cd "$TMP"
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_URI"
+
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          docker build -t "$ECR_URI:$SHORT_SHA" -t "$ECR_URI:latest" services/inventory-api
+          docker push "$ECR_URI:$SHORT_SHA"
+          docker push "$ECR_URI:latest"
+
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query 'taskDefinition' > td.json
+          jq --arg NAME "$CONTAINER_NAME" --arg IMAGE "$ECR_URI:$SHORT_SHA" '
+            .containerDefinitions = (.containerDefinitions
+              | map(if .name == $NAME then .image = $IMAGE else . end)) |
+            {
+              family, taskRoleArn, executionRoleArn, networkMode,
+              containerDefinitions, volumes, placementConstraints,
+              requiresCompatibilities, cpu, memory, tags,
+              pidMode, ipcMode, proxyConfiguration, inferenceAccelerators,
+              runtimePlatform, ephemeralStorage
+            } | del(..|nulls)
+          ' td.json > td-new.json
+
+          NEW_TD=$(aws ecs register-task-definition --cli-input-json file://td-new.json \
+                     --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_TD"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+          ALB=$(aws elbv2 describe-load-balancers --names ultimate-cicd-dev-alb \
+                  --query 'LoadBalancers[0].DNSName' --output text || true)
+
+          echo "short=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "td=$NEW_TD" >> $GITHUB_OUTPUT
+          echo "alb=$ALB" >> $GITHUB_OUTPUT
+
+      - name: Reply deploy ok
+        if: steps.parse.outputs.cmd == '/deploy'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue || context.payload.pull_request;
+            const { SHORT, TD, ALB } = process.env;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `:rocket: Deployed \`${SHORT}\` → \`${TD}\`\nHealth: http://${ALB}/healthz`
+            });
+        env:
+          SHORT: ${{ steps.dep.outputs.short }}
+          TD:    ${{ steps.dep.outputs.td }}
+          ALB:   ${{ steps.dep.outputs.alb }}
