@@ -1,0 +1,63 @@
+name: Deploy inventory-api to ECS
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'services/inventory-api/**'
+      - '.github/workflows/deploy.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPO: inventory-api
+  ECS_CLUSTER: ultimate-dev-cluster
+  ECS_SERVICE: ultimate-cicd-dev-svc
+  ECS_TASK_FAMILY: ultimate-cicd-dev-task
+  CONTAINER_NAME: inventory-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::767044641724:role/ultimate-cicd-dev-gha-oidc
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      - name: Build & push image
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO"
+          IMAGE_TAG=${GITHUB_SHA::7}
+          docker build -t "$ECR_URI:$IMAGE_TAG" -t "$ECR_URI:latest" services/inventory-api
+          docker push "$ECR_URI:$IMAGE_TAG"
+          docker push "$ECR_URI:latest"
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Register task def & deploy
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition > td.json
+          jq '.containerDefinitions[0].image = env.ECR_URI + ":" + env.IMAGE_TAG |
+              del(.revision,.status,.taskDefinitionArn,.requiresAttributes,.compatibilities)' td.json > td-new.json
+          NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://td-new.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_TD_ARN"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Health check
+        run: |
+          ALB=$(aws elbv2 describe-load-balancers --names ultimate-cicd-dev-alb --query 'LoadBalancers[0].DNSName' --output text)
+          curl -s "http://$ALB/healthz" || true
