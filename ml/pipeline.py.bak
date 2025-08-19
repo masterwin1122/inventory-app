@@ -9,7 +9,7 @@ from sagemaker.sklearn.estimator import SKLearn
 from sagemaker.sklearn.model import SKLearnModel
 
 REGION = os.getenv("AWS_REGION", "eu-central-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "REPLACE_ME_BUCKET")
+S3_BUCKET = os.getenv("S3_BUCKET", "emma-ml-767044641724-eu-central-1")
 MODEL_PACKAGE_GROUP = os.getenv("MODEL_PACKAGE_GROUP", "inventory-forecasting")
 ROLE_ARN = os.getenv("SAGEMAKER_EXECUTION_ROLE_ARN", "REPLACE_ME_ROLE_ARN")
 
