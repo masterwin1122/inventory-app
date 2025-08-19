@@ -1,0 +1,5 @@
+sagemaker==2.*
+boto3>=1.28
+pandas>=2.0
+scikit-learn>=1.2
+joblib>=1.2
